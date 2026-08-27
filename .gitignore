@@ -1,0 +1,10 @@
+data/
+output/
+.venv/
+*.DS_Store
+*__pycache__/
+*.log
+wandb/
+
+!tests/
+!tests/**/*.py
