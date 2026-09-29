@@ -45,6 +45,18 @@ policy:
   temperature: 1.0
   topk: 10
 
+  # self-conditioned mixed-prefix training (training only; inference untouched)
+  # enabled=false reproduces the original parallel teacher-forcing forward pass.
+  self_conditioned_prefix:
+    enabled: false
+    self_prob: 0.25
+    prediction_mode: greedy   # only 'greedy' implemented
+    schedule: constant        # 'constant' uses self_prob, 'linear' ramps below
+    start_prob: 0.0
+    end_prob: 0.5
+    warmup_epochs: 100
+    warmup_steps: null        # used only when warmup_epochs is null
+
 training:
   resume: True
   allow_bf16: True

@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from oat.policy.oatpolicy import OATPolicy
+from oat.policy.self_conditioned_prefix import PREDICTION_GREEDY
 
 
 class RFSQPairOATPolicy(OATPolicy):
@@ -148,17 +149,21 @@ class RFSQPairOATPolicy(OATPolicy):
             "action_pred": action_pred,
         }
 
-    def forward(self, batch) -> torch.Tensor:
-        """Train on interleaved [q1_i, q2_i] next-token targets."""
+    def _tokenize_with_bos(self, batch) -> torch.LongTensor:
+        """Return clean interleaved RFSQ targets with BOS prepended.
+
+        Overriding this hook makes both the inherited parallel teacher-forcing
+        path and the pair-aware self-conditioned path use
+        q1_1, q2_1, ..., q1_H, q2_H ordering.
+        """
         with torch.inference_mode():
             stage_major_tokens = self.action_tokenizer.tokenize(batch["action"])
             action_tokens = self._stage_major_to_interleaved(stage_major_tokens)
 
         batch_size = batch["action"].shape[0]
         device = batch["action"].device
-        features = self.obs_encoder(batch["obs"])
 
-        action_tokens = torch.cat(
+        return torch.cat(
             (
                 torch.full(
                     (batch_size, 1),
@@ -171,10 +176,128 @@ class RFSQPairOATPolicy(OATPolicy):
             dim=1,
         )
 
-        logits = self.model(action_tokens[:, :-1], cond=features)
-        vocab_size = logits.shape[-1]
-        return F.cross_entropy(
-            logits.reshape(-1, vocab_size),
-            action_tokens[:, 1:].reshape(-1),
+    def _forward_self_conditioned(self, batch) -> torch.Tensor:
+        """Train with one shared self/GT decision per complete RFSQ pair.
+
+        For pair i, one Bernoulli decision controls both prefix tokens q1_i
+        and q2_i. A self-conditioned pair feeds detached greedy predictions
+        for both tokens; a GT-anchor pair feeds both clean tokens.
+        Supervision always remains the clean interleaved target sequence.
+        """
+        cfg = self.self_conditioned_prefix
+        action_tokens = self._tokenize_with_bos(batch)  # [B, 1 + 2*H]
+        gt_tokens = action_tokens[:, 1:]                # [B, 2*H]
+        batch_size, token_count = gt_tokens.shape
+        device = gt_tokens.device
+
+        if token_count != 2 * self.pair_horizon:
+            raise ValueError(
+                f"Expected {2 * self.pair_horizon} interleaved RFSQ targets, "
+                f"got {token_count}."
+            )
+
+        features = self.obs_encoder(batch["obs"])
+        memory, memory_kv_cache = self.model.encode_cond(features)
+        self_prob = cfg.current_self_prob(
+            epoch=self._sc_epoch,
+            global_step=self._sc_global_step,
         )
+
+        step_tokens = action_tokens[:, :1]  # first input is always BOS
+        past_key_values = None
+        losses = []
+        prefix_flags = []
+        pair_flags = []
+        current_pair_uses_self = None
+
+        for token_idx in range(token_count):
+            logits, past_key_values = self.model.forward_step(
+                step_tokens,
+                memory=memory,
+                past_key_values=past_key_values,
+                memory_kv_cache=memory_kv_cache,
+                pos_offset=token_idx,
+            )
+            step_logits = logits[:, -1, :]
+            losses.append(F.cross_entropy(
+                step_logits,
+                gt_tokens[:, token_idx],
+                reduction="none",
+            ))
+
+            # q1_i starts a pair. Draw once and reuse the same decision for
+            # q2_i, so a pair is never half self-conditioned and half GT.
+            if token_idx % 2 == 0:
+                if self_prob > 0.0:
+                    current_pair_uses_self = (
+                        torch.rand(batch_size, device=device) < self_prob
+                    )
+                else:
+                    current_pair_uses_self = torch.zeros(
+                        batch_size,
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                pair_flags.append(current_pair_uses_self)
+
+            if token_idx == token_count - 1:
+                break
+
+            if self_prob > 0.0:
+                if cfg.prediction_mode != PREDICTION_GREEDY:
+                    raise NotImplementedError(
+                        f"prediction_mode={cfg.prediction_mode!r} is not implemented."
+                    )
+                pred_token = step_logits[:, :self.codebook_size].argmax(
+                    dim=-1
+                ).detach()
+                next_token = torch.where(
+                    current_pair_uses_self,
+                    pred_token,
+                    gt_tokens[:, token_idx],
+                )
+            else:
+                next_token = gt_tokens[:, token_idx]
+
+            prefix_flags.append(current_pair_uses_self)
+            step_tokens = next_token.detach().unsqueeze(1)
+
+        per_token_loss = torch.stack(losses, dim=1)  # [B, 2*H]
+        loss = per_token_loss.mean()
+
+        with torch.no_grad():
+            stats = {
+                "self_prefix_prob": float(self_prob),
+                "loss_total": float(loss.detach()),
+            }
+
+            token_loss = per_token_loss.detach().mean(dim=0)
+            for token_idx in range(token_count):
+                stats[f"loss_register_{token_idx}"] = float(token_loss[token_idx])
+            pair_loss = per_token_loss.detach().reshape(
+                batch_size, self.pair_horizon, 2
+            ).mean(dim=(0, 2))
+            for pair_idx in range(self.pair_horizon):
+                stats[f"loss_pair_{pair_idx}"] = float(pair_loss[pair_idx])
+
+            prefix_mask = torch.stack(prefix_flags, dim=1).float()
+            pair_mask = torch.stack(pair_flags, dim=1).float()
+            stats["self_prefix_fraction"] = float(prefix_mask.mean())
+            stats["gt_anchor_fraction"] = float(1.0 - prefix_mask.mean())
+            stats["self_pair_fraction"] = float(pair_mask.mean())
+            stats["gt_pair_fraction"] = float(1.0 - pair_mask.mean())
+
+            prefix_fraction_per_slot = prefix_mask.mean(dim=0)
+            for token_idx in range(prefix_fraction_per_slot.shape[0]):
+                stats[f"self_prefix_fraction_slot_{token_idx}"] = float(
+                    prefix_fraction_per_slot[token_idx]
+                )
+            pair_fraction_per_slot = pair_mask.mean(dim=0)
+            for pair_idx in range(pair_fraction_per_slot.shape[0]):
+                stats[f"self_pair_fraction_pair_{pair_idx}"] = float(
+                    pair_fraction_per_slot[pair_idx]
+                )
+            self.last_prefix_stats = stats
+
+        return loss
 

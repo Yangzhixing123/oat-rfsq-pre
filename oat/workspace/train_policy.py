@@ -184,6 +184,13 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 if cfg.training.use_ema:
                     self.ema_model.train()
 
+                # advance any training-progress-dependent schedules
+                # (e.g. self-conditioned prefix probability); no-op otherwise
+                unwrapped_model = accelerator.unwrap_model(self.model)
+                if hasattr(unwrapped_model, 'set_training_progress'):
+                    unwrapped_model.set_training_progress(
+                        epoch=self.epoch, global_step=self.global_step)
+
                 loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
                 with tqdm.tqdm(
                     train_dataloader, 
@@ -238,6 +245,10 @@ class TrainPolicyWorkspace(BaseWorkspace):
                                     'epoch': self.epoch,
                                     'lr': lr_scheduler.get_last_lr()[0],
                                 }
+                                # optional per-policy training diagnostics
+                                if hasattr(unwrapped_model, 'get_prefix_stats'):
+                                    for key, value in unwrapped_model.get_prefix_stats().items():
+                                        step_log[f'train/{key}'] = value
                                 if not is_last_batch:
                                     accelerator.log(step_log, step=self.global_step)
                                     json_logger.log(step_log)

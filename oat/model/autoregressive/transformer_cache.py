@@ -243,8 +243,95 @@ class AutoregressiveModel(ModuleAttrMixin):
         logits = self.head(x)
         return logits
 
+    def encode_cond(self,
+        cond: torch.Tensor,
+        precompute_memory_kv: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+        """Encode the conditioning stream once for a whole decoding rollout.
+
+        This is the exact conditioning pipeline used by both ``forward`` and
+        ``generate``, factored out so that a multi-step (KV-cached) decoding
+        loop can reuse it.  Unlike ``generate`` this is *not* wrapped in
+        ``inference_mode``, so it is safe to use during training: gradients flow
+        back into ``cond_emb`` / ``encoder`` / ``cross_attn.kv_proj``.
+
+        cond: (B, T_cond, cond_dim)
+        returns: (memory, memory_kv_cache)
+        """
+        T_cond = cond.shape[1]
+        cond_emb = self.cond_emb(cond)
+        cond_pos_emb = self.cond_pos_emb[:, :T_cond, :]
+        memory = self.drop(cond_emb + cond_pos_emb)
+        memory = self.encoder(memory)
+
+        memory_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        if precompute_memory_kv:
+            B_mem, T_mem = memory.shape[:2]
+            memory_kv_cache = []
+            for block in self.blocks:
+                k_mem, v_mem = block.cross_attn.kv_proj(memory).split(self.n_emb, dim=2)
+                k_mem, v_mem = map(lambda t:
+                    t.view(B_mem, T_mem, self.n_head, self.n_emb // self.n_head).transpose(1, 2),
+                    (k_mem, v_mem))
+                memory_kv_cache.append((k_mem, v_mem))
+        return memory, memory_kv_cache
+
+    def forward_step(self,
+        tokens: torch.LongTensor,
+        memory: torch.Tensor,
+        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        memory_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        pos_offset: int = 0,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """One (or a few) decoding step(s) with an explicit KV cache.
+
+        Same math as ``forward``, but the conditioning stream is passed in
+        pre-encoded and self-attention keys/values from earlier positions come
+        from ``past_key_values`` instead of being recomputed.  Gradients flow
+        through the cache, so a sequential training loop that accumulates
+        per-step losses and backprops once is equivalent to a single pass over
+        the same token sequence (up to per-step dropout resampling).
+
+        tokens: (B, T_step) tokens for absolute positions
+            [pos_offset, pos_offset + T_step)
+        memory: (B, T_cond, n_emb) from ``encode_cond``
+        pos_offset: absolute position of ``tokens[:, 0]`` in the sequence
+        returns: (logits (B, T_step, vocab_size), updated past_key_values)
+        """
+        T_tok = tokens.shape[1]
+        has_cache = past_key_values is not None and any(
+            p is not None for p in past_key_values
+        )
+        if has_cache and T_tok > 1:
+            # CausalSelfAttention disables causal masking whenever a cache is
+            # present, so multi-token steps on top of a cache would leak future
+            # positions.  Feed the prefix in one call, then one token per step.
+            raise ValueError(
+                "forward_step supports T_step > 1 only for the first (uncached) "
+                f"call, got T_step={T_tok} with a non-empty KV cache."
+            )
+        tok_emb = self.tok_emb(tokens)
+        pos_emb = self.tok_pos_emb[:, pos_offset:pos_offset + T_tok, :]
+        x = self.drop(tok_emb + pos_emb)
+
+        if past_key_values is None:
+            past_key_values = [None] * self.n_layer
+        new_past_key_values: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = \
+            [None] * self.n_layer
+        for i, block in enumerate(self.blocks):
+            x, present = block(
+                x, memory,
+                layer_past=past_key_values[i],
+                memory_kv_cache=None if memory_kv_cache is None else memory_kv_cache[i],
+            )
+            new_past_key_values[i] = present
+
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits, new_past_key_values
+
     @torch.inference_mode()
-    def generate(self, 
+    def generate(self,
         prefix: torch.LongTensor, 
         cond: torch.Tensor, 
         max_new_tokens: int,
