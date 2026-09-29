@@ -1,0 +1,64 @@
+name: mimicgen-mt4
+task_name: mimicgen-mt4
+lazy_eval: true
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape:
+      - 128
+      - 128
+      - 3
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape:
+      - 128
+      - 128
+      - 3
+      type: rgb
+    robot0_eef_pos:
+      shape:
+      - 3
+      type: state
+    robot0_eef_quat:
+      shape:
+      - 4
+      type: state
+    robot0_gripper_qpos:
+      shape:
+      - 2
+      type: state
+    task_uid:
+      shape:
+      - 1
+      type: state
+  action:
+    shape:
+    - 7
+env_runner:
+  _target_: oat.env_runner.mimicgen_runner.MimicGenRunner
+  task_name: mt4
+  n_test: 40
+  n_test_vis: 4
+  n_parallel_envs: 1
+  test_start_seed: 1000
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  max_episode_steps: 800
+  image_size: 128
+  source_image_size: 84
+  strict_version: true
+dataset:
+  _target_: oat.dataset.zarr_dataset.ZarrDataset
+  zarr_path: data/mimicgen/stack_square_coffee_mug_N800.zarr
+  obs_keys:
+  - agentview_rgb
+  - robot0_eye_in_hand_rgb
+  - robot0_eef_pos
+  - robot0_eef_quat
+  - robot0_gripper_qpos
+  - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
