@@ -9,7 +9,7 @@ if __name__ == "__main__":
     import pathlib
 
     ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
-    sys.path.append(ROOT_DIR)
+    sys.path.insert(0, ROOT_DIR)
     os.chdir(ROOT_DIR)
 
 import sys
@@ -19,6 +19,7 @@ sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 import os
 import pathlib
+import random
 import click
 import hydra
 import torch
@@ -34,9 +35,27 @@ from typing import List, Optional
 @click.option('-o', '--output_dir', required=True, help="output directory for eval info dump")
 @click.option('-n', '--num_exp', default=1, help="num experiments to run")
 @click.option('-d', '--device', default='cuda:0', help="device to run on")
+@click.option('--exclude-tasks', default=None, help='Comma-separated MimicGen tasks to skip.')
 @click.option('--temperature', default=None, type=float, help="temperature for policy inference")
 @click.option('--topk', default=None, type=int, help="topk for policy inference")
 @click.option('--use_k_tokens', default=None, type=int, help="number of tokens to use for policy inference")
+@click.option(
+    '--seed',
+    default=None,
+    type=int,
+    help=(
+        "optional RNG seed reused for every experiment. If omitted, do not "
+        "explicitly seed policy sampling (the original evaluation behavior)"
+    ),
+)
+@click.option(
+    '--seeds',
+    default=None,
+    help=(
+        "comma-separated RNG seed for each experiment; the count must equal "
+        "--num_exp and this option cannot be combined with --seed"
+    ),
+)
 def eval_policy_sim(
     checkpoint: str,
     output_dir: str,
@@ -46,7 +65,32 @@ def eval_policy_sim(
     temperature: Optional[float] = None,
     topk: Optional[int] = None,
     use_k_tokens: Optional[int] = None,
+    seed: Optional[int] = None,
+    seeds: Optional[str] = None,
+    exclude_tasks: Optional[str] = None,
 ):
+    if num_exp < 1:
+        raise click.BadParameter("must be at least 1", param_hint="--num_exp")
+    if seed is not None and seeds is not None:
+        raise click.UsageError("Use either --seed or --seeds, not both.")
+
+    if seeds is None:
+        experiment_seeds = [seed] * num_exp
+    else:
+        try:
+            experiment_seeds = [
+                int(item.strip()) for item in seeds.split(",") if item.strip()
+            ]
+        except ValueError as exc:
+            raise click.BadParameter(
+                "must be a comma-separated list of integers", param_hint="--seeds"
+            ) from exc
+        if len(experiment_seeds) != num_exp:
+            raise click.BadParameter(
+                f"contains {len(experiment_seeds)} values, but --num_exp is {num_exp}",
+                param_hint="--seeds",
+            )
+
     if os.path.exists(output_dir):
         click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
         os.system(f"rm -rf {output_dir}")
@@ -80,13 +124,10 @@ def eval_policy_sim(
         policy.to(device)
         policy.eval()
         
-        # run eval
+        # Use either one shared RNG seed or an explicit seed for each repetition
+        # so different K values can be compared under the same seed schedule.
         print(f"Running evaluation on {ckpt}")
-        env_runner: BaseRunner = hydra.utils.instantiate(
-            cfg.task.policy.env_runner,
-            output_dir=output_dir,
-        )
-        
+
         kwargs = {}
         if temperature is not None:
             kwargs['temperature'] = temperature
@@ -94,30 +135,82 @@ def eval_policy_sim(
             kwargs['topk'] = topk
         if use_k_tokens is not None:
             kwargs['use_k_tokens'] = use_k_tokens
-        runner_log = env_runner.run(
-            policy,
-            **kwargs
-        )
-        
-        # Store all runs for computing statistics
+        runner_cfg = cfg.task.policy.env_runner
+        excluded = [t.strip() for t in (exclude_tasks or '').split(',') if t.strip()]
+        runner_overrides = {}
+        if excluded:
+            if runner_cfg._target_ != 'oat.env_runner.mimicgen_runner.MimicGenRunner':
+                raise click.UsageError('--exclude-tasks currently supports MimicGen only')
+            runner_overrides['exclude_tasks'] = excluded
+        base_env_seed = int(runner_cfg.get('test_start_seed', 1000))
+        n_test = int(runner_cfg.n_test)
+
+        # Store all runs for computing statistics and keep videos from all runs.
         all_runs = []
-        for key, value in runner_log.items():
-            if isinstance(value, wandb.sdk.data_types.video.Video):
-                runner_log[key] = [value]
-        all_runs.append({k: v for k, v in runner_log.items() if not isinstance(v, list)})
-        print(f"Exp 1: success rate = {runner_log['mean_success_rate']}")
-        
-        for i in range(num_exp - 1):
-            this_log = env_runner.run(policy, **kwargs)
-            print(f"Exp {i + 2}: success rate = {this_log['mean_success_rate']}")
-            all_runs.append({k: v for k, v in this_log.items() if not isinstance(v, list)})
-            # merge logs
-            for key, value in this_log.items():
-                assert key in runner_log
-                if isinstance(value, wandb.sdk.data_types.video.Video):
-                    runner_log[key].append(value)
-                else:
-                    runner_log[key] += value
+        runner_log = None
+        rng_seeds = []
+        env_seed_ranges = []
+
+        for i in range(num_exp):
+            this_seed = experiment_seeds[i]
+            this_env_start_seed = base_env_seed
+            this_env_end_seed = this_env_start_seed + n_test - 1
+            rng_seeds.append(this_seed)
+            env_seed_ranges.append(
+                {'start': this_env_start_seed, 'end': this_env_end_seed}
+            )
+
+            if this_seed is not None:
+                random.seed(this_seed)
+                np.random.seed(this_seed)
+                torch.manual_seed(this_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(this_seed)
+
+            env_runner: BaseRunner = hydra.utils.instantiate(
+                runner_cfg,
+                output_dir=output_dir,
+                test_start_seed=this_env_start_seed,
+                **runner_overrides,
+            )
+            evaluation_episodes = None
+            if hasattr(env_runner, 'episodes'):
+                evaluation_episodes = [dict(task=task, seed=env_seed)
+                                       for task, env_seed, _ in env_runner.episodes]
+                print(f'Evaluating {env_runner.n_test} episodes across {env_runner.tasks}')
+            try:
+                this_log = env_runner.run(policy, **kwargs)
+            finally:
+                env_runner.close()
+
+            print(
+                f"Exp {i + 1}: rng_seed = "
+                f"{this_seed if this_seed is not None else 'unfixed'}, "
+                f"env_seeds = {this_env_start_seed}-{this_env_end_seed}, "
+                f"success rate = {this_log['mean_success_rate']}"
+            )
+            all_runs.append({
+                k: v
+                for k, v in this_log.items()
+                if not isinstance(v, wandb.sdk.data_types.video.Video)
+            })
+
+            if runner_log is None:
+                runner_log = {}
+                for key, value in this_log.items():
+                    if isinstance(value, wandb.sdk.data_types.video.Video):
+                        runner_log[key] = [value]
+                    else:
+                        runner_log[key] = value
+            else:
+                for key, value in this_log.items():
+                    if isinstance(value, wandb.sdk.data_types.video.Video):
+                        runner_log.setdefault(key, []).append(value)
+                    else:
+                        assert key in runner_log
+                        runner_log[key] += value
+
+        assert runner_log is not None
         
         # Compute mean and std for all numeric metrics
         numeric_keys = [k for k in all_runs[0].keys()]
@@ -130,12 +223,17 @@ def eval_policy_sim(
             if num_exp > 1:
                 std_log[key] = np.std(values, ddof=1)  # sample std
         
-        env_runner.close()
-        
         # dump log to json
         json_log = dict()
         json_log['checkpoint'] = ckpt
         json_log['num_exp'] = num_exp
+        json_log['excluded_tasks'] = excluded
+        json_log['evaluation_episodes'] = evaluation_episodes
+        json_log['n_test_evaluated'] = len(evaluation_episodes) if evaluation_episodes is not None else n_test
+        json_log['inference_kwargs'] = kwargs
+        json_log['n_action_steps'] = int(policy.n_action_steps)
+        json_log['rng_seeds'] = rng_seeds
+        json_log['env_seed_ranges'] = env_seed_ranges
         
         # Add mean values
         for key, value in mean_log.items():
