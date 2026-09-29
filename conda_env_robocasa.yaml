@@ -1,0 +1,34 @@
+name: oat-robocasa
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+
+  - einops
+  - hydra-core
+  - wandb
+  - dill
+  - zarr
+  - numba
+  - diffusers
+  - accelerate
+  - gsutil
+  - transformers
+  - av
+  - gymnasium
+
+  - pip:
+      # pytorch
+      - torch
+      - torchvision
+      - --extra-index-url https://download.pytorch.org/whl/nightly/cu129
+
+      - vector-quantize-pytorch
+      - robomimic==0.2.0
+      - git+https://github.com/Chaoqi-LIU/robocasa.git@trajtok#egg=robocasa
+      - git+https://github.com/Chaoqi-LIU/robosuite.git@trajtok#egg=robosuite
+      - easydict
+      - bddl
+      - cloudpickle
